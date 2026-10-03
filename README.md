@@ -48,12 +48,14 @@ by `scripts/convert.py`, and always computed in fp32:
 | [`starkdmi/OmniShotCut-v1.5-mlx-fp16`](https://huggingface.co/starkdmi/OmniShotCut-v1.5-mlx-fp16) (default) | 106 MB | 218 of 219 |
 | [`starkdmi/OmniShotCut-v1.5-mlx-8bit`](https://huggingface.co/starkdmi/OmniShotCut-v1.5-mlx-8bit) | 67 MB | 214 of 219 |
 
-"Identical" is the same frame and the same labels. The fp16 weights' other
-cut is a frame apart. The 8-bit weights miss the Sintel trailer's opening
-fade-in, relabel two of its cuts and place two of Tears of Steel's a frame
-apart. Unconverted fp32 weights match all 219, 4-bit ones 197. Computing in
-fp16 relabels two cuts and moves two even with the fp16 weights, which is why
-compute stays fp32.
+"Identical" is the same frame and the same labels. Unconverted fp32 weights
+match all 219. Rounding weights moves logits — by up to 0.012 for fp16, 0.09
+for 8 bits — and that decides near-ties: the fp16 weights' one difference is a
+label PyTorch itself prefers by 0.0016 and flips the same way when its weights
+are rounded to fp16. Biases and normalization parameters stay fp32 in both
+conversions (0.2 MB): rounding the backbone's batch norms alone moved logits
+as much as rounding every matrix. In fp32 the port's logits are within 1.6e-4
+of PyTorch's in fp64, as close as PyTorch's own fp32 (1.4e-4).
 
 ## Build with Xcode, not SwiftPM
 
@@ -70,14 +72,17 @@ default metallib` — which looks like a broken model. Build with `xcodebuild`
 - **Windowing and stitching are `engine.py`'s**, step for step: windows of 100
   frames overlapping by 10, each trusted for its half of the overlap, every
   segment labelled by the cut that begins it.
-- **Decoding reproduces ffmpeg.** The official code decodes with
-  `ffmpeg -s 128x96 -pix_fmt rgb24`, and the model is sensitive to it: a few
-  levels of difference in scaling or colour conversion move cuts in fades,
-  where brightness is the signal. `FrameReader` takes the decoder's YUV and
-  does what libswscale does — bicubic a = -0.6 stretched over the scale,
-  half-width chroma, swscale's integer YUV→RGB tables, the stream's tagged
-  matrix — on the GPU. 99.7% of values are identical to ffmpeg 9's, the rest
-  within 4 levels.
+- **Decoding is ffmpeg's, bit for bit.** The official code decodes with
+  `ffmpeg -s 128x96 -pix_fmt rgb24`, and the model is sensitive to it: a float
+  bicubic matching 99.7% of ffmpeg's values moved logits more than rounding
+  every weight to fp16. `FrameReader` takes the decoder's YUV and runs
+  libswscale's own arithmetic on the GPU — its fixed-point bicubic filters,
+  14-bit horizontal and 12-bit vertical passes, half-width chroma and integer
+  YUV→RGB tables, the stream's matrix and range — and turns rotated video
+  before scaling it, as ffmpeg does. Every frame of the three test videos and
+  of rotated copies is identical to ffmpeg 9's. Chroma is sited at the centre
+  whatever the stream says: ffmpeg 9's scale filter replaces each frame's
+  chroma location with its own, unspecified, option.
 - **mlx-swift 0.30's `MaxPool2d(padding:)`** pads width and channels of an NHWC
   input, not height and width; the backbone pads by hand.
 
@@ -91,7 +96,7 @@ make test
 | Test | Needs | Checks |
 |---|---|---|
 | `StitchingTests` | nothing | windowing and stitching against `engine.py` |
-| `FrameReaderTests` | videos, ffmpeg | decoded frames against ffmpeg's |
+| `FrameReaderTests` | videos, ffmpeg | every decoded frame, and rotated ones, byte for byte against ffmpeg's |
 | `ReferenceTests` | videos, model | segments against the official PyTorch output |
 
 `ReferenceTests` downloads the default model unless `OMNISHOTCUT_MODEL` names
@@ -102,9 +107,9 @@ CPU and ffmpeg 8's `-fps_mode`:
 
 | Video | Frames | Cuts | fp32 | fp16 | 8-bit |
 |---|---|---|---|---|---|
-| Sintel trailer | 1,253 | 28 | 28 | 28 | 25 |
+| Sintel trailer | 1,253 | 28 | 28 | 27 | 25 |
 | Big Buck Bunny trailer | 812 | 30 | 30 | 30 | 30 |
-| Tears of Steel | 17,620 | 161 | 161 | 160 | 159 |
+| Tears of Steel | 17,620 | 161 | 161 | 161 | 159 |
 
 The videos are © Blender Foundation, [CC BY 3.0](https://creativecommons.org/licenses/by/3.0/),
 [blender.org](https://www.blender.org); they are downloaded, not redistributed.

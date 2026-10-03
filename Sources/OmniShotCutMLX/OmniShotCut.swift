@@ -17,10 +17,11 @@ import MLXNN
 public actor OmniShotCut {
 
     /// The official v1.5 checkpoint converted by `scripts/convert.py
-    /// --bits 0`: stored in fp16, 106 MB, computed in fp32. It finds every
-    /// cut PyTorch does with the same labels. The 8-bit conversion
-    /// (`starkdmi/OmniShotCut-v1.5-mlx-8bit`, 67 MB) relabels or moves a
-    /// few, mostly in fades.
+    /// --bits 0`: matrices stored in fp16, biases and norms in fp32, 106 MB,
+    /// computed in fp32. It finds 218 of PyTorch's 219 reference cuts with the
+    /// same labels; the other is a near-tie PyTorch flips too with fp16
+    /// weights. The 8-bit conversion (`starkdmi/OmniShotCut-v1.5-mlx-8bit`,
+    /// 67 MB) finds 214.
     public static let defaultModel = "starkdmi/OmniShotCut-v1.5-mlx-fp16"
 
     /// Frames shared by neighbouring windows. The official default is 10.
@@ -196,9 +197,8 @@ public actor OmniShotCut {
                     ? (quantization.groupSize, quantization.bits, .affine) : nil
             }
         }
-        // Stored in fp16 to halve the download; computed in fp32, because
-        // fp16 activations move cuts and change labels that fp16 weights do
-        // not.
+        // Stored in fp16 to halve the download; computed in fp32, which keeps
+        // logits as close to PyTorch's fp64 as PyTorch's own fp32.
         for (key, value) in weights where value.dtype == .float16 {
             weights[key] = value.asType(.float32)
         }

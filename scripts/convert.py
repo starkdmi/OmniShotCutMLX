@@ -11,12 +11,13 @@ dropped, and each attention's packed `in_proj_weight`/`in_proj_bias` is split
 into `q_proj`, `k_proj` and `v_proj` so they quantize like any other linear.
 Convolutions go OIHW -> OHWI. With `--bits`, every linear (2-D weight but the
 query embedding) is quantized from fp32 in groups of 64, its scales and
-biases stored in fp16. Everything else is stored as `--dtype`. The Swift
-loader computes in fp32.
+biases stored in fp16. Other matrices are stored as `--dtype`; biases and
+normalization parameters stay fp32. The Swift loader computes in fp32.
 
 Against the official PyTorch code's 219 cuts on the reference videos
 (scripts/fetch-videos.sh), cuts found on the same frame with the same labels:
-fp32 219, fp16 storage 218 (the other a frame apart), 8 bits 214, 4 bits 197.
+fp32 219, fp16 218, 8 bits 214, 4 bits 197. fp16's one difference is a label
+PyTorch prefers by 0.0016 and flips itself when its weights are rounded.
 """
 import argparse
 import json
@@ -61,6 +62,11 @@ def main(checkpoint, destination, bits=8, group_size=64, dtype="float16"):
             arrays[key] = quantized
             arrays[f"{prefix}.scales"] = scales.astype(mx.float16)
             arrays[f"{prefix}.biases"] = biases.astype(mx.float16)
+        elif array.ndim == 1:
+            # Biases and the frozen batch norms' and layer norms' parameters,
+            # 0.2 MB in all, stay fp32. Rounding the batch norms alone to fp16
+            # moved logits by 0.013, as much as rounding every matrix.
+            arrays[key] = array
         else:
             arrays[key] = array.astype(storage)
 

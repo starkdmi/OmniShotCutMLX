@@ -26,7 +26,8 @@ let segments = try await detector.segments(in: videoURL)
 ```
 
 - Every linear but the query embedding is quantized to 8 bits in groups of 64;
-  everything else is fp16. 67 MB; computed in fp32.
+  other matrices are fp16, biases and normalization parameters fp32. 67 MB;
+  computed in fp32.
 - Key names are the official ones, but `backbone.0.body.` is dropped, each
   attention's packed `in_proj` is split into `q_proj`/`k_proj`/`v_proj`, and
   convolutions are OHWI.

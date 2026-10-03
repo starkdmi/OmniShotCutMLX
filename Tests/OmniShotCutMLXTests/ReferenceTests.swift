@@ -88,9 +88,12 @@ final class ReferenceTests: XCTestCase {
                     + "of \(theirs.count) cuts \(matched) within a frame, \(sameFrame) on it, "
                     + "\(sameLabels) with the same labels, \(identical) both; "
                     + String(format: "%.1f s", elapsed))
-            XCTAssertLessThanOrEqual(abs(segments.count - expected.ranges.count), 1, name)
-            XCTAssertGreaterThanOrEqual(Double(matched), 0.98 * Double(theirs.count), name)
-            XCTAssertGreaterThanOrEqual(Double(sameLabels), 0.98 * Double(theirs.count), name)
+            // The fp32 conversion reproduces every cut. fp16 weights flip a
+            // near-tie that PyTorch flips too with the same rounding — one
+            // label in the Sintel trailer, 0.0016 apart in fp64 — so one cut
+            // a video may differ.
+            XCTAssertEqual(segments.count, expected.ranges.count, name)
+            XCTAssertGreaterThanOrEqual(identical, theirs.count - 1, name)
             compared += 1
         }
         try XCTSkipIf(

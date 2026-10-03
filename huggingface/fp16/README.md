@@ -25,14 +25,16 @@ let detector = try await OmniShotCut.pretrained()   // this model
 let segments = try await detector.segments(in: videoURL)
 ```
 
-- Stored in fp16, 106 MB; computed in fp32.
+- Matrices stored in fp16, biases and normalization parameters in fp32;
+  106 MB. Computed in fp32.
 - Key names are the official ones, but `backbone.0.body.` is dropped, each
   attention's packed `in_proj` is split into `q_proj`/`k_proj`/`v_proj`, and
   convolutions are OHWI.
 
 Against the official PyTorch code's 219 cuts on three Blender open movies, the
-package with these weights finds 218 on the same frame with the same labels and
-the last a frame apart. The smaller
+package with these weights finds 218 on the same frame with the same labels.
+The other is a label PyTorch prefers by 0.0016 and flips the same way when its
+own weights are rounded to fp16. The smaller
 [8-bit conversion](https://huggingface.co/starkdmi/OmniShotCut-v1.5-mlx-8bit)
 finds 214. See the package's README for the test.
 
