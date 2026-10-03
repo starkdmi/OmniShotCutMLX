@@ -38,7 +38,9 @@ final class ReferenceTests: XCTestCase {
                 subdirectory: "Fixtures"))
         let reference = try JSONDecoder().decode(Reference.self, from: Data(contentsOf: url))
 
-        let model = environment["OMNISHOTCUT_MODEL"] ?? OmniShotCut.defaultModel
+        let model =
+            environment["OMNISHOTCUT_MODEL"].flatMap { $0.isEmpty ? nil : $0 }
+            ?? OmniShotCut.defaultModel
         let local = URL(fileURLWithPath: (model as NSString).expandingTildeInPath)
         let detector =
             FileManager.default.fileExists(atPath: local.path)
@@ -102,7 +104,7 @@ final class ReferenceTests: XCTestCase {
 
     /// `OMNISHOTCUT_VIDEOS`, or `videos/` in the package.
     static var videoDirectory: URL {
-        if let path = ProcessInfo.processInfo.environment["OMNISHOTCUT_VIDEOS"] {
+        if let path = ProcessInfo.processInfo.environment["OMNISHOTCUT_VIDEOS"], !path.isEmpty {
             return URL(
                 fileURLWithPath: (path as NSString).expandingTildeInPath, isDirectory: true)
         }
