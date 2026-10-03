@@ -15,8 +15,8 @@ let package = Package(
         .executable(name: "omnishotcut", targets: ["OmniShotCutCLI"]),
     ],
     dependencies: [
-        .package(
-            url: "https://github.com/ml-explore/mlx-swift", .upToNextMinor(from: "0.30.3")),
+        // Every release in the range is checked against the PyTorch reference.
+        .package(url: "https://github.com/ml-explore/mlx-swift", "0.30.3"..<"0.33.0"),
         // Only `Hub`, to download the converted weights.
         .package(url: "https://github.com/huggingface/swift-transformers", from: "1.2.0"),
     ],
