@@ -1,0 +1,12 @@
+.DS_Store
+.build/
+.derivedData/
+.swiftpm/
+*.xcodeproj
+*.xcworkspace
+__pycache__/
+*.pth
+*.safetensors
+/videos/
+Package.resolved
+*.profraw
