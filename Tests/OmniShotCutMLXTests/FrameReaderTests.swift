@@ -1,3 +1,4 @@
+import AVFoundation
 import Foundation
 import XCTest
 
@@ -6,7 +7,7 @@ import XCTest
 /// `FrameReader` against the decode the official code runs,
 /// `ffmpeg -s 128x96 -pix_fmt rgb24 -fps_mode passthrough`, frame by frame and
 /// byte by byte, on the videos `scripts/fetch-videos.sh` downloads and on
-/// rotated copies of one of them. Skips without ffmpeg.
+/// turned, mirrored and re-tagged copies of one of them. Skips without ffmpeg.
 final class FrameReaderTests: XCTestCase {
 
     func testFramesAreFFmpegs() async throws {
@@ -21,30 +22,107 @@ final class FrameReaderTests: XCTestCase {
         try XCTSkipIf(compared == 0, "no videos; run scripts/fetch-videos.sh")
     }
 
-    /// ffmpeg turns a rotated picture before scaling it, so the horizontal
-    /// filter runs along the stored picture's columns.
-    func testRotatedFramesAreFFmpegs() async throws {
+    /// ffmpeg turns and mirrors the picture before scaling it, so the
+    /// horizontal filter runs along the stored picture's columns after a
+    /// quarter turn. With the original these are all eight orientations.
+    func testTurnedAndMirroredFramesAreFFmpegs() async throws {
         guard let ffmpeg = Self.ffmpeg else { throw XCTSkip("ffmpeg not found on PATH") }
-        let source = ReferenceTests.videoDirectory.appendingPathComponent(
-            "sintel_trailer-480p.mp4")
-        guard FileManager.default.fileExists(atPath: source.path) else {
-            throw XCTSkip("no videos; run scripts/fetch-videos.sh")
+        let (source, directory) = try sintelAndScratchDirectory()
+        let orientations = [
+            ("rotated-90", ["-display_rotation", "90"]),
+            ("rotated-180", ["-display_rotation", "180"]),
+            ("rotated-270", ["-display_rotation", "270"]),
+            ("mirrored", ["-display_hflip"]),
+            ("flipped", ["-display_vflip"]),
+            ("rotated-90-mirrored", ["-display_rotation", "90", "-display_hflip"]),
+            ("rotated-90-flipped", ["-display_rotation", "90", "-display_vflip"]),
+        ]
+        for (name, options) in orientations {
+            let video = directory.appendingPathComponent("\(name).mp4")
+            try Self.run(
+                ffmpeg,
+                ["-v", "error"] + options + [
+                    "-i", source.path, "-t", "12", "-c", "copy", video.path,
+                ])
+            try await compare(video, ffmpeg: ffmpeg)
         }
-        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
-            "omnishotcut-rotation-\(UUID().uuidString)", isDirectory: true)
-        try FileManager.default.createDirectory(
-            at: directory, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: directory) }
-        for degrees in [90, 180, 270] {
-            let rotated = directory.appendingPathComponent("rotated-\(degrees).mp4")
+    }
+
+    /// The transform's signs as ffmpeg's autorotate reads them: a mirror is a
+    /// flip, not a half turn.
+    func testTransformsAreReadAsFFmpegReadsThem() {
+        let cases: [(a: CGFloat, b: CGFloat, c: CGFloat, d: CGFloat, filters: String)] = [
+            (1, 0, 0, 1, ""),
+            (-1, 0, 0, 1, "hflip"),
+            (1, 0, 0, -1, "vflip"),
+            (-1, 0, 0, -1, "vflip,hflip"),
+            (0, 1, -1, 0, "transpose,hflip"),  // transpose=clock
+            (0, -1, 1, 0, "transpose,vflip"),  // transpose=cclock
+            (0, 1, 1, 0, "transpose"),  // transpose=cclock_flip
+            (0, -1, -1, 0, "transpose,vflip,hflip"),  // transpose=clock_flip
+        ]
+        for (a, b, c, d, filters) in cases {
+            let orientation = Orientation(
+                CGAffineTransform(a: a, b: b, c: c, d: d, tx: 0, ty: 0))
+            let applied = [
+                orientation.transposed ? "transpose" : nil,
+                orientation.reversesRows ? "vflip" : nil,
+                orientation.reversesColumns ? "hflip" : nil,
+            ]
+            XCTAssertEqual(
+                applied.compactMap { $0 }.joined(separator: ","), filters, "\([a, b, c, d])")
+        }
+    }
+
+    /// A track joined from clips coded differently has a sample description
+    /// per clip. ffmpeg converts each clip with its own range and matrix, here
+    /// limited BT.709 and then full BT.601.
+    func testJoinedClipsKeepTheirOwnColour() async throws {
+        guard let ffmpeg = Self.ffmpeg else { throw XCTSkip("ffmpeg not found on PATH") }
+        guard #available(macOS 15, iOS 18, *) else {
+            throw XCTSkip("joining needs AVAssetExportSession.export(to:as:)")
+        }
+        let (source, directory) = try sintelAndScratchDirectory()
+        var clips: [URL] = []
+        for (name, tags) in [
+            ("limited-709", "video_full_range_flag=0:matrix_coefficients=1"),
+            ("full-601", "video_full_range_flag=1:matrix_coefficients=6"),
+        ] {
+            let clip = directory.appendingPathComponent("\(name).mp4")
             try Self.run(
                 ffmpeg,
                 [
-                    "-v", "error", "-display_rotation", "\(degrees)", "-i", source.path,
-                    "-t", "12", "-c", "copy", rotated.path,
+                    "-v", "error", "-t", "6", "-i", source.path, "-an", "-c", "copy",
+                    "-bsf:v", "h264_metadata=\(tags)", clip.path,
                 ])
-            try await compare(rotated, ffmpeg: ffmpeg)
+            clips.append(clip)
         }
+        let joined = directory.appendingPathComponent("joined.mov")
+        try await Self.join(clips, into: joined)
+        let tracks = try await AVURLAsset(url: joined).loadTracks(withMediaType: .video)
+        let track = try XCTUnwrap(tracks.first)
+        let descriptions = try await track.load(.formatDescriptions)
+        XCTAssertEqual(descriptions.count, 2, "one sample description per clip")
+        try await compare(joined, ffmpeg: ffmpeg)
+    }
+
+    /// The last segment ends with the video, not with audio that runs on.
+    func testEndIsWhereTheVideoEnds() async throws {
+        guard let ffmpeg = Self.ffmpeg else { throw XCTSkip("ffmpeg not found on PATH") }
+        let (source, directory) = try sintelAndScratchDirectory()
+        let video = directory.appendingPathComponent("long-audio.mp4")
+        try Self.run(
+            ffmpeg,
+            [
+                "-v", "error", "-t", "6", "-i", source.path, "-f", "lavfi", "-t", "10", "-i",
+                "sine", "-map", "0:v", "-map", "1:a", "-c:v", "copy", "-c:a", "aac", video.path,
+            ])
+        let reader = try await FrameReader(url: video, width: 128, height: 96)
+        var last: TimeInterval = 0
+        while let frame = try reader.next() { last = frame.time }
+        XCTAssertEqual(reader.end, last + 1.0 / 24, accuracy: 1e-6, "one frame past the last")
+        let duration = try await AVURLAsset(url: video).load(.duration).seconds
+        XCTAssertGreaterThan(duration, reader.end + 3, "the audio runs on")
     }
 
     private func compare(_ video: URL, ffmpeg: URL) async throws {
@@ -78,6 +156,47 @@ final class FrameReaderTests: XCTestCase {
         )
         XCTAssertEqual(frames * frameBytes, theirs.count, "\(name): frame count")
         XCTAssertEqual(different, 0, name)
+    }
+
+    /// The Sintel trailer, and a directory removed after the test.
+    private func sintelAndScratchDirectory() throws -> (source: URL, directory: URL) {
+        let source = ReferenceTests.videoDirectory.appendingPathComponent(
+            "sintel_trailer-480p.mp4")
+        guard FileManager.default.fileExists(atPath: source.path) else {
+            throw XCTSkip("no videos; run scripts/fetch-videos.sh")
+        }
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "omnishotcut-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: directory, withIntermediateDirectories: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: directory) }
+        return (source, directory)
+    }
+
+    /// The clips' video one after another without re-encoding, each keeping
+    /// its sample description.
+    @available(macOS 15, iOS 18, *)
+    private static func join(_ clips: [URL], into output: URL) async throws {
+        let composition = AVMutableComposition()
+        let track = try XCTUnwrap(
+            composition.addMutableTrack(
+                withMediaType: .video, preferredTrackID: kCMPersistentTrackID_Invalid))
+        var end = CMTime.zero
+        for clip in clips {
+            let asset = AVURLAsset(url: clip)
+            let tracks = try await asset.loadTracks(withMediaType: .video)
+            let source = try XCTUnwrap(tracks.first)
+            let range = try await source.load(.timeRange)
+            // A track holds its asset weakly, and inserting needs the asset.
+            try withExtendedLifetime(asset) {
+                try track.insertTimeRange(range, of: source, at: end)
+            }
+            end = end + range.duration
+        }
+        let session = try XCTUnwrap(
+            AVAssetExportSession(asset: composition, presetName: AVAssetExportPresetPassthrough)
+        )
+        try await session.export(to: output, as: .mov)
     }
 
     @discardableResult

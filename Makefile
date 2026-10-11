@@ -6,9 +6,11 @@ DESTINATION = 'platform=macOS,arch=arm64'
 
 .PHONY: cli build-tests test videos format
 
+# Xcode 27 instruments the release tool for code coverage unless told not to.
 cli:
 	xcodebuild build -scheme omnishotcut -configuration Release \
-		-destination $(DESTINATION) -derivedDataPath "$(DERIVED)" -quiet
+		-destination $(DESTINATION) -derivedDataPath "$(DERIVED)" -quiet \
+		ENABLE_CODE_COVERAGE=NO
 	@echo "$(PRODUCTS)/omnishotcut"
 
 build-tests:

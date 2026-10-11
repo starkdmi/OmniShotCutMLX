@@ -1,3 +1,4 @@
+import AVFoundation
 import CryptoKit
 import Foundation
 import XCTest
@@ -63,6 +64,9 @@ final class ReferenceTests: XCTestCase {
             let elapsed = Date().timeIntervalSince(started)
 
             XCTAssertEqual(segments.last?.frames.upperBound, expected.frames, name)
+            let tracks = try await AVURLAsset(url: video).loadTracks(withMediaType: .video)
+            let videoEnd = try await XCTUnwrap(tracks.first).load(.timeRange).end.seconds
+            XCTAssertEqual(segments.last?.end, videoEnd, "\(name): ends with the video track")
             let theirs = Array(
                 zip(expected.ranges, zip(expected.intra, expected.inter)).dropFirst())
             var matched = 0

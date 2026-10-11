@@ -119,7 +119,7 @@ public actor OmniShotCut {
         return Self.assemble(cuts: cuts, frameCount: times.count).map { range in
             ShotSegment(
                 start: times[range.start],
-                end: range.end < times.count ? times[range.end] : source.duration,
+                end: range.end < times.count ? times[range.end] : source.end,
                 frames: range.start..<range.end,
                 kind: ShotSegment.Kind(rawValue: range.intra) ?? .shot,
                 boundary: ShotSegment.Boundary(rawValue: range.inter) ?? .hardCut)

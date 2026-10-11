@@ -170,6 +170,12 @@ struct SwscaleFilter: Sendable {
 /// `yuv2rgb_X_c_template`): one clipped luma table, indexed by luma plus an
 /// integer offset per chroma value.
 struct SwscaleRGBTables: Sendable {
+    /// The stream's matrix and range, which the tables are made for.
+    struct Colour: Sendable, Hashable {
+        var matrix: Matrix
+        var fullRange: Bool
+    }
+
     let luma: [UInt8]
     let redV: [Int]
     let greenU: [Int]
@@ -177,7 +183,7 @@ struct SwscaleRGBTables: Sendable {
     let blueU: [Int]
 
     /// `ff_yuv2rgb_coeffs`, by the stream's matrix.
-    enum Matrix: Sendable {
+    enum Matrix: Sendable, Hashable {
         case bt709, bt601, smpte240m, bt2020, fcc
 
         var coefficients: (Int64, Int64, Int64, Int64) {
@@ -191,9 +197,10 @@ struct SwscaleRGBTables: Sendable {
         }
     }
 
-    init(matrix: Matrix, fullRange: Bool) {
+    init(_ colour: Colour) {
+        let fullRange = colour.fullRange
         // C division truncates toward zero; Swift's does too.
-        var (crv, cbu, cgu, cgv) = matrix.coefficients
+        var (crv, cbu, cgu, cgv) = colour.matrix.coefficients
         cgu = -cgu
         cgv = -cgv
         var cy: Int64 = 1 << 16
@@ -241,6 +248,7 @@ final class PlaneScaler {
     let sourceHeight: Int
     let width: Int
     let height: Int
+    let colour: SwscaleRGBTables.Colour
     private let chromaWidth: Int
     private let chromaHeight: Int
     private let chromaOutputWidth: Int
@@ -256,7 +264,7 @@ final class PlaneScaler {
 
     init(
         sourceWidth: Int, sourceHeight: Int, chromaWidth: Int, chromaHeight: Int, width: Int,
-        height: Int, tables: SwscaleRGBTables
+        height: Int, colour: SwscaleRGBTables.Colour
     ) {
         self.sourceWidth = sourceWidth
         self.sourceHeight = sourceHeight
@@ -264,6 +272,7 @@ final class PlaneScaler {
         self.chromaHeight = chromaHeight
         self.width = width
         self.height = height
+        self.colour = colour
         // Packed RGB keeps chroma at half the output width and full height.
         chromaOutputWidth = (width + 1) / 2
         func increment(_ source: Int, _ destination: Int) -> Int {
@@ -308,13 +317,14 @@ final class PlaneScaler {
             return twoTap && sumsToOne(lumaV) && sumsToOne(chromaV) ? 0 : 1 << 18
         }
         rounding = MLXArray(rows)
+        let tables = SwscaleRGBTables(colour)
         self.tables = MLXArray(
             (tables.luma.map(Int.init) + tables.redV + tables.greenU + tables.greenV
                 + tables.blueU).map { Int32($0) })
     }
 
-    func matches(width: Int, height: Int) -> Bool {
-        sourceWidth == width && sourceHeight == height
+    func matches(width: Int, height: Int, colour: SwscaleRGBTables.Colour) -> Bool {
+        sourceWidth == width && sourceHeight == height && self.colour == colour
     }
 
     /// `luma` is `[frames, height, width]`, `chroma` `[frames, height / 2,

@@ -26,7 +26,8 @@ for segment in try await detector.segments(in: videoURL) {
 
 Segments cover the whole video in order, without gaps. `start` and `end` are
 presentation times, `frames` the decoded frame indices as the official code
-numbers them. Take keyframes from `kind == .shot`: a dissolve's middle frame is
+numbers them. The last segment ends with the video track, however long the
+audio runs. Take keyframes from `kind == .shot`: a dissolve's middle frame is
 two pictures at once, a fade's is half black.
 
 The command line tool prints the same:
@@ -78,9 +79,10 @@ default metallib` — which looks like a broken model. Build with `xcodebuild`
   every weight to fp16. `FrameReader` takes the decoder's YUV and runs
   libswscale's own arithmetic on the GPU — its fixed-point bicubic filters,
   14-bit horizontal and 12-bit vertical passes, half-width chroma and integer
-  YUV→RGB tables, the stream's matrix and range — and turns rotated video
-  before scaling it, as ffmpeg does. Every frame of the three test videos and
-  of rotated copies is identical to ffmpeg 9's. Chroma is sited at the centre
+  YUV→RGB tables, each frame's own matrix and range — and turns and mirrors
+  the picture as the track's transform says before scaling it, as ffmpeg
+  does. Every frame of the three test videos, and of turned, mirrored and
+  re-tagged copies, is identical to ffmpeg 9's. Chroma is sited at the centre
   whatever the stream says: ffmpeg 9's scale filter replaces each frame's
   chroma location with its own, unspecified, option.
 - **mlx-swift 0.30's `MaxPool2d(padding:)`** pads width and channels of an NHWC
@@ -96,7 +98,7 @@ make test
 | Test | Needs | Checks |
 |---|---|---|
 | `StitchingTests` | nothing | windowing and stitching against `engine.py` |
-| `FrameReaderTests` | videos, ffmpeg | every decoded frame, and rotated ones, byte for byte against ffmpeg's |
+| `FrameReaderTests` | videos, ffmpeg | every decoded frame, of turned, mirrored and joined copies too, byte for byte against ffmpeg's |
 | `ReferenceTests` | videos, model | segments against the official PyTorch output |
 
 `ReferenceTests` downloads the default model unless `OMNISHOTCUT_MODEL` names

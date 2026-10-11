@@ -59,8 +59,8 @@ public struct ShotSegment: Sendable, Hashable, Codable {
 
     /// Presentation time of the first frame, in seconds.
     public var start: TimeInterval
-    /// Presentation time of the next segment's first frame, or the video's
-    /// duration for the last segment.
+    /// Presentation time of the next segment's first frame, or where the
+    /// video track ends for the last segment, however long the audio runs.
     public var end: TimeInterval
     /// Decoded frame indices, `start..<end`, as the official code numbers
     /// them.
