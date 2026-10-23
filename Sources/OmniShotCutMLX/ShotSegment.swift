@@ -89,6 +89,7 @@ public enum OmniShotCutError: Error, Sendable, CustomStringConvertible {
     case decodingFailed(URL, String)
     case unsupportedPixelFormat(URL)
     case modelUnavailable(String, String)
+    case metalUnavailable(String)
 
     public var description: String {
         switch self {
@@ -100,6 +101,7 @@ public enum OmniShotCutError: Error, Sendable, CustomStringConvertible {
         case .unsupportedPixelFormat(let url):
             return "\(url.lastPathComponent): decoder did not return 4:2:0 YUV"
         case .modelUnavailable(let model, let detail): return "\(model): \(detail)"
+        case .metalUnavailable(let detail): return "Metal: \(detail)"
         }
     }
 }
