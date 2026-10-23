@@ -1,19 +1,19 @@
 import AVFoundation
 import CoreVideo
 import Foundation
-@preconcurrency import MLX
+import Metal
 
 // OmniShotCut's official code decodes with `ffmpeg -s 128x96 -pix_fmt rgb24`,
 // and the model notices the difference. So the decoder's YUV is taken as it
-// is — H.264 decoding is bit-exact — and scaled and converted with
-// libswscale's own arithmetic (Swscale.swift).
+// is — H.264 decoding is bit-exact — and scaled and converted to the same
+// bytes as ffmpeg's (FrameScaler.swift, docs/frame-scaler-spec.md).
 
 /// Every frame of the first video track as the official pipeline sees it:
 /// 128×96 RGB, stretched, turned and mirrored as ffmpeg auto-rotates.
 ///
-/// The decoder's planes are copied out a few frames at a time and scaled and
-/// converted on the GPU: resizing full-HD planes on the CPU cost four times
-/// the decode itself.
+/// The decoder's planes are copied a batch at a time into shared Metal
+/// buffers and scaled and converted on the GPU while the next batch decodes:
+/// resizing full-HD planes on the CPU cost four times the decode itself.
 final class FrameReader {
     /// Where the video track ends. Audio running past the last frame does not
     /// count.
@@ -25,19 +25,44 @@ final class FrameReader {
     private let height: Int
     private let orientation: Orientation
     private let matrices: MatrixLookup
-    private var scaler: PlaneScaler?
+    private let metal: MetalContext
+    private var scaler: FrameScaler?
+    private var scalerColour: Colour?
     private var ready: [(pixels: [UInt8], time: TimeInterval)] = []
+    /// One batch converts on the GPU from one slot while the next decodes
+    /// into the other; a batch's frames are copied out of its slot before
+    /// the slot is filled again.
+    private let slots = [Slot(), Slot()]
+    private var fillSlot = 0
     /// A batch whose conversion is running on the GPU while the next one is
     /// decoded.
-    private var converting: (rgb: MLXArray, times: [TimeInterval])?
+    private var converting: Batch?
     private var carried: CMSampleBuffer?
     private var finished = false
 
-    /// Frames scaled together. Bounds the planes held at once — 16 frames
-    /// of 4K is 200 MB — while keeping the GPU busy.
+    /// Frames scaled together at most, enough to keep the GPU busy.
     private static let batch = 16
+    /// Bytes of decoded planes a batch holds at most, in each of two slots:
+    /// 16 frames up to 1080p, 5 of 4K.
+    private static let planeBudget = 64 << 20
+
+    private struct Batch {
+        let slot: Int
+        let times: [TimeInterval]
+        let commandBuffer: MTLCommandBuffer
+    }
+
+    /// The matrix and range a frame is converted with.
+    private struct Colour: Hashable {
+        var matrix: YCbCrMatrix
+        var fullRange: Bool
+    }
 
     init(url: URL, width: Int, height: Int) async throws {
+        guard let metal = MetalContext.shared else {
+            throw OmniShotCutError.metalUnavailable("no Metal device")
+        }
+        self.metal = metal
         self.url = url
         let asset = AVURLAsset(url: url)
         guard let track = try await asset.loadTracks(withMediaType: .video).first else {
@@ -70,30 +95,48 @@ final class FrameReader {
         self.height = height
     }
 
+    deinit {
+        reader.cancelReading()
+    }
+
     /// RGB bytes and presentation time of the next frame, `nil` at the end.
     func next() throws -> (pixels: [UInt8], time: TimeInterval)? {
         while ready.isEmpty, !finished || converting != nil {
             let previous = converting
             converting = nil
             if !finished { try fill() }
-            if let previous { collect(previous) }
+            if let previous { try collect(previous) }
         }
         return ready.isEmpty ? nil : ready.removeFirst()
     }
 
-    private func collect(_ batch: (rgb: MLXArray, times: [TimeInterval])) {
-        let rgb = batch.rgb.asArray(UInt8.self)
+    private func collect(_ batch: Batch) throws {
+        batch.commandBuffer.waitUntilCompleted()
+        guard batch.commandBuffer.status == .completed else {
+            let detail =
+                batch.commandBuffer.error.map { "\($0)" } ?? "command buffer not completed"
+            throw OmniShotCutError.decodingFailed(url, "GPU conversion failed: \(detail)")
+        }
+        let rgb = slots[batch.slot].rgb!.contents()
         let frameBytes = width * height * 3
         for (index, time) in batch.times.enumerated() {
-            ready.append((Array(rgb[(index * frameBytes)..<((index + 1) * frameBytes)]), time))
+            let frame = UnsafeRawBufferPointer(
+                start: rgb + index * frameBytes, count: frameBytes)
+            ready.append(([UInt8](frame), time))
         }
     }
 
-    /// Decode up to a batch of frames of one size and colour and start
-    /// converting them.
+    /// Decode up to a batch of frames of one size and colour into the free
+    /// slot and start converting them.
     private func fill() throws {
-        var planes = PlaneBatch()
-        while planes.count < Self.batch {
+        let slot = slots[fillSlot]
+        let device = metal.device
+        var layout: PlaneLayout?
+        var colour: Colour?
+        var limit = Self.batch
+        var times: [TimeInterval] = []
+        times.reserveCapacity(Self.batch)
+        while times.count < limit {
             guard let sample = carried ?? output.copyNextSampleBuffer() else {
                 finished = true
                 break
@@ -101,40 +144,126 @@ final class FrameReader {
             carried = nil
             guard let image = CMSampleBufferGetImageBuffer(sample) else { continue }
             let time = CMSampleBufferGetPresentationTimeStamp(sample)
-            if !planes.append(image, time: time.seconds, matrix: matrices.matrix(at: time)) {
+            CVPixelBufferLockBaseAddress(image, .readOnly)
+            defer { CVPixelBufferUnlockBaseAddress(image, .readOnly) }
+            guard CVPixelBufferGetPlaneCount(image) == 2,
+                let lumaBase = CVPixelBufferGetBaseAddressOfPlane(image, 0),
+                let chromaBase = CVPixelBufferGetBaseAddressOfPlane(image, 1)
+            else {
+                throw OmniShotCutError.unsupportedPixelFormat(url)
+            }
+            let frame = PlaneLayout(
+                width: CVPixelBufferGetWidthOfPlane(image, 0),
+                height: CVPixelBufferGetHeightOfPlane(image, 0),
+                chromaWidth: CVPixelBufferGetWidthOfPlane(image, 1),
+                chromaHeight: CVPixelBufferGetHeightOfPlane(image, 1))
+            let frameColour = Colour(
+                matrix: matrices.matrix(at: time),
+                fullRange: CVPixelBufferGetPixelFormatType(image)
+                    == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange)
+            if let layout, frame != layout || frameColour != colour {
                 // A new frame size or colour starts the next batch.
                 carried = sample
                 break
             }
+            if layout == nil {
+                layout = frame
+                colour = frameColour
+                limit = min(
+                    Self.batch,
+                    max(1, Self.planeBudget / (frame.lumaBytes + frame.chromaBytes)))
+                try slot.reserve(\.luma, bytes: limit * frame.lumaBytes, device: device)
+                try slot.reserve(\.chroma, bytes: limit * frame.chromaBytes, device: device)
+            }
+            let index = times.count
+            Self.copy(
+                lumaBase, rowBytes: CVPixelBufferGetBytesPerRowOfPlane(image, 0),
+                rows: frame.height, bytes: frame.width,
+                to: slot.luma!.contents() + index * frame.lumaBytes)
+            Self.copy(
+                chromaBase, rowBytes: CVPixelBufferGetBytesPerRowOfPlane(image, 1),
+                rows: frame.chromaHeight, bytes: frame.chromaWidth * 2,
+                to: slot.chroma!.contents() + index * frame.chromaBytes)
+            times.append(time.seconds)
         }
         if reader.status == .failed {
             throw OmniShotCutError.decodingFailed(
                 url, reader.error?.localizedDescription ?? "decoding failed")
         }
-        guard planes.count > 0 else { return }
-        guard planes.isBiplanar else { throw OmniShotCutError.unsupportedPixelFormat(url) }
+        guard let layout, let colour, !times.isEmpty else { return }
 
-        let count = planes.count
-        var luma = MLXArray(planes.luma, [count, planes.height, planes.width])
-        var chroma = MLXArray(
-            planes.chroma, [count, planes.chromaHeight, planes.chromaWidth, 2])
-        // ffmpeg turns the picture before it scales it, so the filters run
-        // along the displayed axes.
-        luma = orientation.apply(to: luma)
-        chroma = orientation.apply(to: chroma)
-        let sourceWidth = luma.dim(2)
-        let sourceHeight = luma.dim(1)
-        if scaler?.matches(width: sourceWidth, height: sourceHeight, colour: planes.colour)
-            != true
-        {
-            scaler = PlaneScaler(
-                sourceWidth: sourceWidth, sourceHeight: sourceHeight,
-                chromaWidth: chroma.dim(2), chromaHeight: chroma.dim(1), width: width,
-                height: height, colour: planes.colour)
+        if scaler?.layout != layout || scalerColour != colour {
+            scaler = try FrameScaler(
+                layout: layout, quarterTurns: orientation.quarterTurns,
+                flipped: orientation.flipped, width: width, height: height,
+                matrix: colour.matrix, fullRange: colour.fullRange, metal: metal)
+            scalerColour = colour
         }
-        let rgb = scaler!.convert(luma: luma, chroma: chroma)
-        asyncEval(rgb)
-        converting = (rgb, planes.times)
+        let scaler = scaler!
+        // The intermediate values never leave the GPU.
+        try slot.reserve(
+            \.scratch, bytes: scaler.scratchBytes(frames: limit), device: device,
+            options: .storageModePrivate)
+        try slot.reserve(\.rgb, bytes: limit * width * height * 3, device: device)
+        guard let commandBuffer = metal.queue.makeCommandBuffer() else {
+            throw OmniShotCutError.metalUnavailable("could not create a command buffer")
+        }
+        try scaler.encode(
+            frames: times.count, luma: slot.luma!, chroma: slot.chroma!, scratch: slot.scratch!,
+            rgb: slot.rgb!, into: commandBuffer)
+        commandBuffer.commit()
+        converting = Batch(slot: fillSlot, times: times, commandBuffer: commandBuffer)
+        fillSlot ^= 1
+    }
+
+    /// Copies a plane without its row padding.
+    private static func copy(
+        _ base: UnsafeMutableRawPointer, rowBytes: Int, rows: Int, bytes: Int,
+        to destination: UnsafeMutableRawPointer
+    ) {
+        if rowBytes == bytes {
+            destination.copyMemory(from: base, byteCount: rows * bytes)
+            return
+        }
+        for row in 0..<rows {
+            (destination + row * bytes).copyMemory(
+                from: base + row * rowBytes, byteCount: bytes)
+        }
+    }
+}
+
+/// The stored size of a frame's luma plane and of its interleaved chroma
+/// plane, in pixels.
+struct PlaneLayout: Sendable, Hashable {
+    var width: Int
+    var height: Int
+    var chromaWidth: Int
+    var chromaHeight: Int
+
+    var lumaBytes: Int { width * height }
+    var chromaBytes: Int { chromaWidth * chromaHeight * 2 }
+}
+
+/// One batch's buffers. The planes and the RGB output are shared with the
+/// CPU; each buffer grows to the largest batch it has held and is reused
+/// after that.
+private final class Slot {
+    var luma: MTLBuffer?
+    var chroma: MTLBuffer?
+    var scratch: MTLBuffer?
+    var rgb: MTLBuffer?
+
+    func reserve(
+        _ buffer: ReferenceWritableKeyPath<Slot, MTLBuffer?>, bytes: Int, device: MTLDevice,
+        options: MTLResourceOptions = .storageModeShared
+    ) throws {
+        if let existing = self[keyPath: buffer], existing.length >= bytes { return }
+        // Released first, so the old and the new buffer are not held at once.
+        self[keyPath: buffer] = nil
+        guard let made = device.makeBuffer(length: max(bytes, 1), options: options) else {
+            throw OmniShotCutError.metalUnavailable("could not allocate \(bytes) bytes")
+        }
+        self[keyPath: buffer] = made
     }
 }
 
@@ -156,18 +285,14 @@ struct Orientation {
         reversesColumns = (transposed ? transform.c : transform.a) < 0
     }
 
-    /// `[frames, height, width, ...]` as displayed, by ffmpeg's `transpose`,
-    /// `vflip` and `hflip`.
-    func apply(to planes: MLXArray) -> MLXArray {
-        func reversed(_ array: MLXArray, axis: Int) -> MLXArray {
-            let count = array.dim(axis)
-            return array.take(MLXArray(Array((0..<Int32(count)).reversed())), axis: axis)
-        }
-        var planes = planes
-        if transposed { planes = planes.swappedAxes(1, 2) }
-        if reversesRows { planes = reversed(planes, axis: 1) }
-        if reversesColumns { planes = reversed(planes, axis: 2) }
-        return planes
+    /// The same orientation as `FrameScaler` takes it: clockwise quarter
+    /// turns, then whether the result is mirrored.
+    var quarterTurns: Int {
+        transposed ? (reversesRows ? 3 : 1) : (reversesColumns ? 2 : 0)
+    }
+
+    var flipped: Bool {
+        transposed ? reversesRows == reversesColumns : reversesRows != reversesColumns
     }
 }
 
@@ -177,7 +302,7 @@ struct Orientation {
 /// at 480p, where ffmpeg takes BT.601. A track that can't provide sample
 /// cursors gets its first description's matrix throughout.
 private struct MatrixLookup {
-    private let first: SwscaleRGBTables.Matrix
+    private let first: YCbCrMatrix
     /// Set only when the descriptions disagree: the track, to find each
     /// frame's sample, and its edits, as sample cursors count time before
     /// them.
@@ -196,7 +321,7 @@ private struct MatrixLookup {
         }
     }
 
-    func matrix(at time: CMTime) -> SwscaleRGBTables.Matrix {
+    func matrix(at time: CMTime) -> YCbCrMatrix {
         guard let track,
             let mapping = segments.first(where: {
                 !$0.isEmpty && $0.timeMapping.target.containsTime(time)
@@ -210,7 +335,7 @@ private struct MatrixLookup {
 
     /// ffmpeg reads the stream's matrix; untagged video is BT.601 there, not
     /// guessed from the resolution.
-    private static func matrix(_ description: CMFormatDescription) -> SwscaleRGBTables.Matrix {
+    private static func matrix(_ description: CMFormatDescription) -> YCbCrMatrix {
         let tag =
             CMFormatDescriptionGetExtension(
                 description, extensionKey: kCMFormatDescriptionExtension_YCbCrMatrix) as? String
@@ -220,72 +345,5 @@ private struct MatrixLookup {
         }
         if tag == kCMFormatDescriptionYCbCrMatrix_ITU_R_2020 as String { return .bt2020 }
         return .bt601
-    }
-}
-
-/// The luma and interleaved chroma planes of a few frames, copied out of the
-/// decoder's buffers without their row padding.
-private struct PlaneBatch {
-    var luma: [UInt8] = []
-    var chroma: [UInt8] = []
-    var times: [TimeInterval] = []
-    var width = 0
-    var height = 0
-    var chromaWidth = 0
-    var chromaHeight = 0
-    var colour = SwscaleRGBTables.Colour(matrix: .bt601, fullRange: false)
-    var isBiplanar = true
-    var count: Int { times.count }
-
-    /// `false` when the frame's size or colour differs from the batch's.
-    mutating func append(
-        _ image: CVPixelBuffer, time: TimeInterval, matrix: SwscaleRGBTables.Matrix
-    ) -> Bool {
-        CVPixelBufferLockBaseAddress(image, .readOnly)
-        defer { CVPixelBufferUnlockBaseAddress(image, .readOnly) }
-        guard CVPixelBufferGetPlaneCount(image) == 2,
-            let lumaBase = CVPixelBufferGetBaseAddressOfPlane(image, 0),
-            let chromaBase = CVPixelBufferGetBaseAddressOfPlane(image, 1)
-        else {
-            isBiplanar = false
-            times.append(time)
-            return true
-        }
-        let w = CVPixelBufferGetWidthOfPlane(image, 0)
-        let h = CVPixelBufferGetHeightOfPlane(image, 0)
-        let cw = CVPixelBufferGetWidthOfPlane(image, 1)
-        let ch = CVPixelBufferGetHeightOfPlane(image, 1)
-        let colour = SwscaleRGBTables.Colour(
-            matrix: matrix,
-            fullRange: CVPixelBufferGetPixelFormatType(image)
-                == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange)
-        if count > 0,
-            (w, h, cw, ch) != (width, height, chromaWidth, chromaHeight)
-                || colour != self.colour
-        {
-            return false
-        }
-        (width, height, chromaWidth, chromaHeight) = (w, h, cw, ch)
-        self.colour = colour
-        func copy(
-            _ base: UnsafeMutableRawPointer, rowBytes: Int, rows: Int, bytes: Int,
-            into: inout [UInt8]
-        ) {
-            let source = base.assumingMemoryBound(to: UInt8.self)
-            for row in 0..<rows {
-                into.append(
-                    contentsOf: UnsafeBufferPointer(
-                        start: source + row * rowBytes, count: bytes))
-            }
-        }
-        copy(
-            lumaBase, rowBytes: CVPixelBufferGetBytesPerRowOfPlane(image, 0), rows: h, bytes: w,
-            into: &luma)
-        copy(
-            chromaBase, rowBytes: CVPixelBufferGetBytesPerRowOfPlane(image, 1), rows: ch,
-            bytes: cw * 2,
-            into: &chroma)
-        times.append(time)
-        return true
     }
 }

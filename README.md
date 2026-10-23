@@ -76,10 +76,11 @@ default metallib` — which looks like a broken model. Build with `xcodebuild`
 - **Decoding is ffmpeg's, bit for bit.** The official code decodes with
   `ffmpeg -s 128x96 -pix_fmt rgb24`, and the model is sensitive to it: a float
   bicubic matching 99.7% of ffmpeg's values moved logits more than rounding
-  every weight to fp16. `FrameReader` takes the decoder's YUV and runs
-  libswscale's own arithmetic on the GPU — its fixed-point bicubic filters,
-  14-bit horizontal and 12-bit vertical passes, half-width chroma and integer
-  YUV→RGB tables, each frame's own matrix and range — and turns and mirrors
+  every weight to fp16. `FrameReader` takes the decoder's YUV and scales and
+  converts it on the GPU to the same bytes as ffmpeg's scaler — fixed-point
+  bicubic filters, 14-bit horizontal and 12-bit vertical passes, half-width
+  chroma and integer YUV→RGB, each frame's own matrix and range, as
+  [docs/frame-scaler-spec.md](docs/frame-scaler-spec.md) specifies — and turns and mirrors
   the picture as the track's transform says before scaling it, as ffmpeg
   does. Every frame of the three test videos, and of turned, mirrored and
   re-tagged copies, is identical to ffmpeg 9's. Chroma is sited at the centre
